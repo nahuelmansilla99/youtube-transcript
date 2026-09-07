@@ -15,7 +15,10 @@ export class TranscriptService {
   private async getInnertube(): Promise<Innertube> {
     if (!this.innertubePromise) {
       this.innertubePromise = (async () => {
-        const { Innertube, UniversalCache } = await import('youtubei.js');
+        const { Innertube, UniversalCache, Log } = await import('youtubei.js');
+        // Silenciar logs/warnings internos de la librería
+        Log.setLevel(Log.Level.NONE);
+
         const proxyUrl = process.env.YOUTUBE_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
         let customFetch: typeof fetch | undefined = undefined;
 
@@ -111,12 +114,45 @@ export class TranscriptService {
     return textParts.join(' ').replace(/\s+/g, ' ').trim();
   }
 
+  private async getVideoInfo(yt: Innertube, videoId: string) {
+    // Usar clientes móviles/TV primero para evitar el bloqueo del cliente WEB en Datacenters
+    const clients: Array<'ANDROID' | 'TV_EMBEDDED' | 'IOS' | 'WEB'> = [
+      'ANDROID',
+      'TV_EMBEDDED',
+      'IOS',
+      'WEB',
+    ];
+
+    let lastError: Error | null = null;
+    for (const client of clients) {
+      try {
+        const info = await yt.getInfo(videoId, client as any);
+        if (info?.captions?.caption_tracks && info.captions.caption_tracks.length > 0) {
+          return info;
+        }
+      } catch (err) {
+        lastError = err;
+      }
+    }
+
+    // Si ninguno devolvió pistas, intentar método predeterminado
+    try {
+      const defaultInfo = await yt.getInfo(videoId);
+      if (defaultInfo) return defaultInfo;
+    } catch (err) {
+      if (lastError) throw lastError;
+      throw err;
+    }
+
+    throw lastError || new Error('No se pudo obtener información del video.');
+  }
+
   async extractText(youtubeUrl: string, targetLang = 'es', allowFallback = true): Promise<ExtractResult> {
     const videoId = this.extractVideoId(youtubeUrl);
 
     try {
       const yt = await this.getInnertube();
-      const info = await yt.getInfo(videoId);
+      const info = await this.getVideoInfo(yt, videoId);
 
       const tracks = info.captions?.caption_tracks;
       if (!tracks || tracks.length === 0) {
