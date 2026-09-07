@@ -1,5 +1,5 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
-import { YoutubeTranscript } from 'youtube-transcript';
+import { Injectable, BadRequestException, Logger } from '@nestjs/common';
+import type { Innertube } from 'youtubei.js';
 
 export interface ExtractResult {
   transcript: string;
@@ -9,68 +9,205 @@ export interface ExtractResult {
 
 @Injectable()
 export class TranscriptService {
-  async extractText(youtubeUrl: string, targetLang = 'es', allowFallback = true): Promise<ExtractResult> {
-    // 1. Intentar obtener los subtítulos con el idioma solicitado originalmente (ej. 'es')
-    try {
-      const items = await YoutubeTranscript.fetchTranscript(youtubeUrl, { lang: targetLang });
-      if (items && items.length > 0) {
-        return {
-          transcript: items.map((item) => item.text).join(' '),
-          langUsed: targetLang,
-          fallbackApplied: false,
+  private readonly logger = new Logger(TranscriptService.name);
+  private innertubePromise: Promise<Innertube> | null = null;
+
+  private async getInnertube(): Promise<Innertube> {
+    if (!this.innertubePromise) {
+      this.innertubePromise = (async () => {
+        const { Innertube, UniversalCache } = await import('youtubei.js');
+        const proxyUrl = process.env.YOUTUBE_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+        let customFetch: typeof fetch | undefined = undefined;
+
+        if (proxyUrl) {
+          const maskedProxy = proxyUrl.replace(/:([^:@]+)@/, ':****@');
+          this.logger.log(`Inicializando YouTube Innertube con Proxy: ${maskedProxy}`);
+          try {
+            const { ProxyAgent } = await import('undici');
+            const dispatcher = new ProxyAgent(proxyUrl);
+            customFetch = (input: RequestInfo | URL, init?: RequestInit) => {
+              return fetch(input, {
+                ...init,
+                // @ts-expect-error undici dispatcher in node fetch
+                dispatcher,
+              });
+            };
+          } catch (proxyErr) {
+            this.logger.error(`Error al configurar proxy: ${proxyErr.message}`);
+          }
+        }
+
+        return await Innertube.create({
+          cache: new UniversalCache(false),
+          generate_session_locally: true,
+          fetch: customFetch,
+        });
+      })();
+    }
+    return this.innertubePromise;
+  }
+
+  private extractVideoId(urlOrId: string): string {
+    if (!urlOrId || typeof urlOrId !== 'string') {
+      throw new BadRequestException('La URL o ID del video es obligatoria.');
+    }
+
+    const trimmed = urlOrId.trim();
+    if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) {
+      return trimmed;
+    }
+
+    const match = trimmed.match(
+      /(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=|shorts\/))([a-zA-Z0-9_-]{11})/,
+    );
+    if (match && match[1]) {
+      return match[1];
+    }
+
+    throw new BadRequestException('No se pudo extraer un ID de video válido a partir de la URL proporcionada.');
+  }
+
+  private async fetchCaptionText(trackUrl: string): Promise<string> {
+    const url = new URL(trackUrl);
+    url.searchParams.set('fmt', 'json3');
+
+    const proxyUrl = process.env.YOUTUBE_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+    let fetchOptions: RequestInit = {};
+
+    if (proxyUrl) {
+      try {
+        const { ProxyAgent } = await import('undici');
+        const dispatcher = new ProxyAgent(proxyUrl);
+        fetchOptions = {
+          // @ts-expect-error undici dispatcher in node fetch
+          dispatcher,
         };
+      } catch (err) {
+        this.logger.error(`Error al aplicar proxy en descarga de subtítulos: ${err.message}`);
       }
-    } catch (err) {
-      if (!allowFallback) {
+    }
+
+    const response = await fetch(url.toString(), fetchOptions);
+    if (!response.ok) {
+      throw new Error(`Error al descargar subtítulos (${response.status}: ${response.statusText})`);
+    }
+
+    const data = await response.json();
+    if (!data?.events || !Array.isArray(data.events)) {
+      throw new Error('El formato de datos de subtítulos no es válido.');
+    }
+
+    const textParts: string[] = [];
+    for (const event of data.events) {
+      if (event.segs && Array.isArray(event.segs)) {
+        for (const seg of event.segs) {
+          if (seg.utf8 && seg.utf8 !== '\n') {
+            textParts.push(seg.utf8);
+          }
+        }
+      }
+    }
+
+    return textParts.join(' ').replace(/\s+/g, ' ').trim();
+  }
+
+  async extractText(youtubeUrl: string, targetLang = 'es', allowFallback = true): Promise<ExtractResult> {
+    const videoId = this.extractVideoId(youtubeUrl);
+
+    try {
+      const yt = await this.getInnertube();
+      const info = await yt.getInfo(videoId);
+
+      const tracks = info.captions?.caption_tracks;
+      if (!tracks || tracks.length === 0) {
+        this.logger.warn(`El video ${videoId} no contiene pistas de subtítulos disponibles.`);
+        throw new BadRequestException(
+          `No se pudo extraer la transcripción. El video no contiene subtítulos en el idioma '${targetLang}' ni en idiomas alternativos.`,
+        );
+      }
+
+      const targetLangLower = targetLang.toLowerCase();
+
+      // 1. Intentar coincidencia exacta con el idioma solicitado (ej. 'es')
+      let selectedTrack = tracks.find((t) => t.language_code?.toLowerCase() === targetLangLower);
+      let fallbackApplied = false;
+
+      // 2. Si no existe y fallback está desactivado, arrojar error
+      if (!selectedTrack && !allowFallback) {
         throw new BadRequestException(
           `No se encontraron subtítulos disponibles para el idioma solicitado '${targetLang}'.`,
         );
       }
-    }
 
-    // 2. Si fallback está activado:
-    //    Si se pidió español, la prioridad ideal para IA en n8n es:
-    //    Variantes en Español -> Variantes en Inglés -> Cualquier idioma de origen disponible.
-    if (allowFallback) {
-      const priorityLangsMap: Record<string, string[]> = {
-        es: ['es-419', 'es-ES', 'es-MX', 'es-AR', 'en', 'en-US', 'en-GB'],
-        en: ['en-US', 'en-GB', 'en-CA', 'es', 'es-419'],
-      };
+      // 3. Si fallback está activado:
+      if (!selectedTrack && allowFallback) {
+        const priorityLangsMap: Record<string, string[]> = {
+          es: ['es-419', 'es-es', 'es-mx', 'es-ar', 'es-us', 'en', 'en-us', 'en-gb'],
+          en: ['en-us', 'en-gb', 'en-ca', 'es', 'es-419'],
+        };
 
-      const fallbackList = priorityLangsMap[targetLang] || [];
+        const fallbackList = priorityLangsMap[targetLangLower] || [];
 
-      for (const langCode of fallbackList) {
-        try {
-          const items = await YoutubeTranscript.fetchTranscript(youtubeUrl, { lang: langCode });
-          if (items && items.length > 0) {
-            return {
-              transcript: items.map((item) => item.text).join(' '),
-              langUsed: langCode,
-              fallbackApplied: true,
-            };
+        // 3a. Buscar por lista de prioridad dialectal
+        for (const langCode of fallbackList) {
+          const match = tracks.find((t) => t.language_code?.toLowerCase() === langCode);
+          if (match) {
+            selectedTrack = match;
+            fallbackApplied = true;
+            break;
           }
-        } catch (err) {
-          // Probar siguiente idioma de prioridad
+        }
+
+        // 3b. Buscar por prefijo (ej. si pidieron 'es', aceptar cualquier 'es-*')
+        if (!selectedTrack) {
+          const prefixMatch = tracks.find((t) =>
+            t.language_code?.toLowerCase().startsWith(targetLangLower),
+          );
+          if (prefixMatch) {
+            selectedTrack = prefixMatch;
+            fallbackApplied = true;
+          }
+        }
+
+        // 3c. Fallback al primer idioma disponible (idioma original del video)
+        if (!selectedTrack && tracks.length > 0) {
+          selectedTrack = tracks[0];
+          fallbackApplied = true;
         }
       }
 
-      // 3. Fallback al idioma original/predeterminado disponible del video (ej. ja, fr, de, etc.)
-      try {
-        const items = await YoutubeTranscript.fetchTranscript(youtubeUrl);
-        if (items && items.length > 0) {
-          return {
-            transcript: items.map((item) => item.text).join(' '),
-            langUsed: items[0]?.lang || 'default',
-            fallbackApplied: true,
-          };
-        }
-      } catch (err) {
-        // Fallaron todos los reintentos
+      if (!selectedTrack || !selectedTrack.base_url) {
+        throw new BadRequestException(
+          `No se pudo extraer la transcripción. El video no contiene subtítulos en el idioma '${targetLang}' ni en idiomas alternativos.`,
+        );
       }
+
+      const transcript = await this.fetchCaptionText(selectedTrack.base_url);
+
+      if (!transcript || transcript.trim().length === 0) {
+        throw new BadRequestException(
+          `La transcripción del video ${videoId} se encuentra vacía.`,
+        );
+      }
+
+      return {
+        transcript,
+        langUsed: selectedTrack.language_code || 'unknown',
+        fallbackApplied,
+      };
+    } catch (err) {
+      if (err instanceof BadRequestException) {
+        throw err;
+      }
+
+      this.logger.error(
+        `Error al extraer transcripción para el video ${videoId} (${youtubeUrl}): ${err.message}`,
+        err.stack,
+      );
+
+      throw new BadRequestException(
+        `No se pudo extraer la transcripción: ${err.message || 'Error desconocido al consultar YouTube.'}`,
+      );
     }
-
-    throw new BadRequestException(
-      `No se pudo extraer la transcripción. El video no contiene subtítulos en el idioma '${targetLang}' ni en idiomas alternativos.`,
-    );
   }
 }

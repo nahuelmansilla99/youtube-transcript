@@ -19,7 +19,7 @@ Microservicio construido con **NestJS** y **TypeScript** para extraer la transcr
 
 - **Framework**: [NestJS](https://nestjs.org/) (v11)
 - **Lenguaje**: TypeScript
-- **Librería de transcripción**: `youtube-transcript`
+- **Librería de transcripción**: `youtubei.js` (Innertube API) + `undici` (soporte de Proxies)
 - **Documentación OpenAPI**: `@nestjs/swagger` + `swagger-ui-express`
 - **Validación**: `class-validator` + `class-transformer`
 - **Contenedores**: Docker (Multi-stage build)
@@ -170,6 +170,7 @@ Este repositorio está 100% optimizado para desplegarse mediante **Dokploy** en 
 3. **Variables de Entorno**:
    - `PORT=3000`
    - `NODE_ENV=production`
+   - `YOUTUBE_PROXY` *(Opcional)*: `http://user:pass@host:port` (por si requieres enrutar el tráfico por un proxy residencial si tu proveedor VPS es bloqueado por YouTube).
 4. **Puerto y Dominio**:
    - Configura el puerto del contenedor a `3000`.
    - Asigna tu dominio o subdominio en Dokploy (ejemplo: `transcript-api.tudominio.com`).
